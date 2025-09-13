@@ -1,0 +1,40 @@
+# ==============================
+# ESP-IDF / ESP32 Build Output
+# ==============================
+/build/
+/CMakeCache.txt
+/CMakeFiles/
+/sdkconfig.old
+/sdkconfig.user
+/*.log
+/*.bin
+*.elf
+*.map
+
+# ==============================
+# IDE / Editor Configs
+# ==============================
+/.vscode/
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+# ==============================
+# Python / OTA Scripts
+# ==============================
+__pycache__/
+*.pyc
+venv/
+
+# ==============================
+# System Files
+# ==============================
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Temporary / Backup Files
+# ==============================
+*~
+*.swp
+*.tmp
