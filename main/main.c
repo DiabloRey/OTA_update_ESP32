@@ -11,8 +11,8 @@
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
 
-#define WIFI_SSID      "DRey"
-#define WIFI_PASS      "qwertyui"
+#define WIFI_SSID      "SSID"	// Edit your SSID here for WiFi
+#define WIFI_PASS      "12345678"	//Edit your PSWD here for WiFi
 #define OTA_URL        "http://192.168.0.106:8000/firmware.bin"
 
 static const char *TAG = "OTA_HTTP";
