@@ -1,22 +1,38 @@
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
-#include "esp_http_client.h"
-#include "esp_ota_ops.h"
-#include "esp_app_format.h"
+#include "main.h"
 
-#define WIFI_SSID      "SSID"	// Edit your SSID here for WiFi
-#define WIFI_PASS      "12345678"	//Edit your PSWD here for WiFi
-#define OTA_URL        "http://192.168.0.106:8000/firmware.bin"
+#ifdef ENC_DECR
+#include "mbedtls/aes.h"
+
+// Example 128-bit key (16 bytes)
+static const unsigned char aes_key[16] = {
+    0x01, 0x02, 0x03, 0x04,
+    0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0A, 0x0B, 0x0C,
+    0x0D, 0x0E, 0x0F, 0x10
+};
+
+// IV (Initialization Vector) for CBC mode (16 bytes)
+static const unsigned char aes_iv[16] = {
+    0x10, 0x0F, 0x0E, 0x0D,
+    0x0C, 0x0B, 0x0A, 0x09,
+    0x08, 0x07, 0x06, 0x05,
+    0x04, 0x03, 0x02, 0x01
+};
+#endif
+
+#define OTA_CHUNK_SIZE 1024
+uint8_t buffer[OTA_CHUNK_SIZE + 16];    // Shared buffer
+
+#define HEADER_SIZE 0x100   // leave first 256 bytes unencrypted
+
+#define WIFI_SSID      "SSID"  // provide your WiFi SSID
+#define WIFI_PASS      "PSWD"  // provide your WiFi PSWD
+#define OTA_URL        "http://172.24.231.57:8000/firmware_encrypted.bin"
 
 static const char *TAG = "OTA_HTTP";
+static bool wifi_connected = false;
 
+/* ---------- Wi-Fi ---------- */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
@@ -28,6 +44,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_connected = true;
     }
 }
 
@@ -38,28 +55,28 @@ static void wifi_init(void)
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip);
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
+    wifi_config_t wifi_config = { 0 };
+    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+/* ---------- Print firmware info once ---------- */
 static void print_running_firmware_info(void)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (!app_desc) return;
     ESP_LOGI(TAG, "Running Firmware Info:");
     ESP_LOGI(TAG, " Project: %s", app_desc->project_name);
     ESP_LOGI(TAG, " Version: %s", app_desc->version);
@@ -67,175 +84,222 @@ static void print_running_firmware_info(void)
     ESP_LOGI(TAG, " ESP-IDF: %s", app_desc->idf_ver);
 }
 
-static void ota_task(void *pvParameter)
+/* ---------- do_ota_update ---------- */
+static bool do_ota_update(void)
 {
+    bool updated = false;
+    esp_err_t err;
+
+    ESP_LOGI(TAG, "Starting OTA...");
+
     esp_http_client_config_t config = {
         .url = OTA_URL,
-	    .timeout_ms = 60000,
-	    .is_async = false,
-	    .skip_cert_common_name_check = true,
-	    .transport_type = HTTP_TRANSPORT_OVER_TCP,
-	    .keep_alive_enable = true,
+        .timeout_ms = 60000,
+        .is_async = false,
+        .skip_cert_common_name_check = true,
+        .transport_type = HTTP_TRANSPORT_OVER_TCP,
+        .keep_alive_enable = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to init HTTP client");
+        return false;
+    }
 
     if (esp_http_client_open(client, 0) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection");
+        ESP_LOGW(TAG, "Server not available");
         esp_http_client_cleanup(client);
-        vTaskDelete(NULL);
-        return;
+        return false;
     }
-    esp_http_client_fetch_headers(client);   // <— add this
 
-ESP_LOGI(TAG, "HTTP status %d, content length %d",
-         (unsigned int)esp_http_client_get_status_code(client),
-         (unsigned int)esp_http_client_get_content_length(client));
+    if (esp_http_client_fetch_headers(client) < 0) {
+        ESP_LOGE(TAG, "Failed to fetch headers");
+        goto cleanup;
+    }
 
-    esp_ota_handle_t update_handle = 0;
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "HTTP status code: %d", status);
+    if (status != 200) {
+        ESP_LOGE(TAG, "HTTP server returned error");
+    }
+
+#ifdef ENC_DECR
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    if (mbedtls_aes_setkey_dec(&aes, aes_key, 128) != 0) {
+        ESP_LOGE(TAG, "AES key setup failed");
+        goto cleanup;
+    }
+    uint8_t iv[16];
+    memcpy(iv, aes_iv, 16);
+    uint8_t decrypted[OTA_CHUNK_SIZE + 16];
+    int leftover_len = 0;
+#endif
+
+    // --- Read OTA header (plaintext) ---
+    uint8_t header_buf[HEADER_SIZE];
+    int read_bytes = 0;
+    while (read_bytes < HEADER_SIZE) {
+        int r = esp_http_client_read(client, (char *)header_buf + read_bytes,
+                                     HEADER_SIZE - read_bytes);
+        if (r <= 0) {
+            ESP_LOGE(TAG, "Failed to read OTA header, read=%d", r);
+            goto cleanup;
+        }
+        read_bytes += r;
+    }
+
+    esp_app_desc_t new_app_desc;
+    // esp_app_desc_t starts at offset 0x20
+    memcpy(&new_app_desc, header_buf + 0x20, sizeof(esp_app_desc_t));
+
+
+    // ---------------- Version Check ----------------
+    const esp_app_desc_t *current_app = esp_app_get_description();
+    if (new_app_desc.version[0] == '\0' || strlen(new_app_desc.version) >= sizeof(new_app_desc.version)) {
+        ESP_LOGE(TAG, "Invalid firmware header (version string corrupted), skipping OTA");
+        goto cleanup;
+    }
+
+    if (strcmp(new_app_desc.project_name, current_app->project_name) == 0 &&
+        strcmp(new_app_desc.version, current_app->version) == 0) {
+        ESP_LOGI(TAG, "Firmware up-to-date: %s v%s", new_app_desc.project_name, new_app_desc.version);
+        goto cleanup;
+    }
+
+    ESP_LOGI(TAG, "New firmware found: %s v%s (current: %s v%s)",
+             new_app_desc.project_name, new_app_desc.version,
+             current_app->project_name, current_app->version);
+
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (!update_partition) {
         ESP_LOGE(TAG, "No OTA partition found");
-        esp_http_client_cleanup(client);
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%lx",
-             update_partition->subtype, (unsigned long)update_partition->address);
-
-    /* ---- Robust header read ---- */
-    esp_image_header_t img_header;
-    esp_image_segment_header_t seg_header;
-    esp_app_desc_t new_app_info;
-
-    size_t hdr_size = sizeof(img_header) + sizeof(seg_header) + sizeof(new_app_info);
-    uint8_t *hdr_buf = (uint8_t *)malloc(hdr_size);
-    if (!hdr_buf) {
-        ESP_LOGE(TAG, "Failed to allocate header buffer");
-        esp_http_client_cleanup(client);
-        vTaskDelete(NULL);
-        return;
+        goto cleanup;
     }
 
-    size_t hdr_received = 0;
-    const TickType_t retry_delay = pdMS_TO_TICKS(200);
-    const int max_header_wait_ms = 60000;
-    int elapsed_ms = 0;
-
-    while (hdr_received < hdr_size) {
-        int r = esp_http_client_read(client, (char *)(hdr_buf + hdr_received), hdr_size - hdr_received);
-        if (r < 0) {
-            ESP_LOGE(TAG, "HTTP read error while fetching header (%d)", r);
-            free(hdr_buf);
-            esp_http_client_cleanup(client);
-            vTaskDelete(NULL);
-            return;
-        } else if (r == 0) {
-            if (elapsed_ms >= max_header_wait_ms) {
-                ESP_LOGE(TAG, "Timeout while reading firmware header");
-                free(hdr_buf);
-                esp_http_client_cleanup(client);
-                vTaskDelete(NULL);
-                return;
-            }
-            vTaskDelay(retry_delay);
-            elapsed_ms += 200;
-            continue;
-        } else {
-            hdr_received += (size_t)r;
-            elapsed_ms = 0;
-        }
-    }
-
-    memcpy(&img_header, hdr_buf, sizeof(img_header));
-    memcpy(&seg_header, hdr_buf + sizeof(img_header), sizeof(seg_header));
-    memcpy(&new_app_info, hdr_buf + sizeof(img_header) + sizeof(seg_header), sizeof(new_app_info));
-
-    const esp_app_desc_t *running_app_info = esp_app_get_description();
-    ESP_LOGI(TAG, "Current firmware version: %s", running_app_info->version);
-    ESP_LOGI(TAG, "Available firmware version: %s", new_app_info.version);
-
-    if (strcmp(new_app_info.version, running_app_info->version) <= 0) {
-        ESP_LOGW(TAG, "New firmware is not newer. Skipping OTA.");
-        free(hdr_buf);
-        esp_http_client_cleanup(client);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Proceeding with OTA update...");
-
-    esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
-    if (err != ESP_OK) {
+    esp_ota_handle_t update_handle = 0;
+    if ((err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle)) != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
-        free(hdr_buf);
-        esp_http_client_cleanup(client);
-        vTaskDelete(NULL);
-        return;
+        goto cleanup;
     }
 
-    err = esp_ota_write(update_handle, hdr_buf, hdr_received);
-    free(hdr_buf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_write header failed (%s)", esp_err_to_name(err));
-        esp_ota_end(update_handle);
-        esp_http_client_cleanup(client);
-        vTaskDelete(NULL);
-        return;
+    // Write header (plaintext, unencrypted)
+    if ((err = esp_ota_write(update_handle, header_buf, read_bytes)) != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
+        goto cleanup;
     }
 
-    int binary_file_len = hdr_received;
-    char ota_write_data[1024];
+    int total_written = read_bytes;
+
+    // --- OTA main loop ---
     while (1) {
-        int data_read = esp_http_client_read(client, ota_write_data, sizeof(ota_write_data));
-        if (data_read < 0) {
-            ESP_LOGE(TAG, "Error reading data");
+        int r = esp_http_client_read(client, (char *)buffer + leftover_len, OTA_CHUNK_SIZE - leftover_len);
+        if (r < 0) {
+            ESP_LOGE(TAG, "HTTP read error: %d", r);
             break;
-        } else if (data_read == 0) {
-            ESP_LOGI(TAG, "Connection closed, all data received");
+        } else if (r == 0) {
+#ifdef ENC_DECR
+            if (leftover_len > 0) {
+                if (leftover_len % 16 != 0) break;
+                if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, leftover_len, iv, buffer, decrypted) != 0) break;
+                int pad = decrypted[leftover_len - 1];
+                if (pad <= 0 || pad > 16) pad = 0;
+                esp_ota_write(update_handle, decrypted, leftover_len - pad);
+            }
+#endif
             break;
         }
 
-        err = esp_ota_write(update_handle, ota_write_data, data_read);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
-            break;
+#ifdef ENC_DECR
+        leftover_len += r;
+        int full_blocks2 = (leftover_len / 16) * 16;
+        if (full_blocks2 > 0) {
+            if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, full_blocks2, iv, buffer, decrypted) != 0) break;
+            esp_ota_write(update_handle, decrypted, full_blocks2);
+            total_written += full_blocks2;
+            leftover_len -= full_blocks2;
+            if (leftover_len > 0) memmove(buffer, buffer + full_blocks2, leftover_len);
         }
-        binary_file_len += data_read;
+#else
+        esp_ota_write(update_handle, buffer, r);
+        total_written += r;
+#endif
     }
 
-    ESP_LOGI(TAG, "Total binary length written: %d", binary_file_len);
+    ESP_LOGI(TAG, "Total written: %d bytes", total_written);
 
     if (esp_ota_end(update_handle) == ESP_OK) {
-        err = esp_ota_set_boot_partition(update_partition);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "OTA update successful, restarting...");
+        if ((err = esp_ota_set_boot_partition(update_partition)) == ESP_OK) {
+            ESP_LOGI(TAG, "OTA complete, rebooting...");
+            updated = true;
             esp_restart();
-        } else {
-            ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)", esp_err_to_name(err));
         }
-    } else {
-        ESP_LOGE(TAG, "esp_ota_end failed");
     }
 
+cleanup:
+#ifdef ENC_DECR
+    mbedtls_aes_free(&aes);
+#endif
     esp_http_client_cleanup(client);
+    return updated;
+}
+
+/* ---------- ota_task ---------- */
+void ota_task(void *pvParameter)
+{
+    ESP_LOGI(TAG, "OTA Task started");
+
+    const TickType_t wifi_retry_delay = pdMS_TO_TICKS(5000);
+    const TickType_t ota_retry_delay  = pdMS_TO_TICKS(30000);
+
+    bool ota_done = false;
+    int ota_fail_count = 0;
+
+    while (1) {
+        if (!wifi_connected) {
+            ESP_LOGW(TAG, "Wi-Fi not connected, retrying in 5s...");
+            vTaskDelay(wifi_retry_delay);
+            continue;
+        }
+
+        if (!ota_done) {
+            ESP_LOGI(TAG, "Checking for OTA update...");
+            bool updated = do_ota_update();
+            if (updated) {
+                ota_done = true;
+                break;
+            } else {
+                ota_fail_count++;
+                ESP_LOGW(TAG, "OTA attempt %d failed, retrying...", ota_fail_count);
+                TickType_t backoff = ota_retry_delay * (ota_fail_count > 5 ? 5 : ota_fail_count);
+                vTaskDelay(backoff);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(60000));
+        }
+    }
+
     vTaskDelete(NULL);
 }
 
+/* ---------- app_main ---------- */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Version: %s", esp_app_get_description()->version);
-    ESP_LOGI(TAG, "Compiled: %s %s", __DATE__, __TIME__);
-    ESP_LOGI(TAG, "ESP-IDF: %s", esp_get_idf_version());
-
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_init();
+    print_running_firmware_info();
 
-    vTaskDelay(pdMS_TO_TICKS(10000));  // wait for IP
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && running->subtype != ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_ota_mark_app_valid_cancel_rollback() returned %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Marked OTA app as valid");
+        }
+    } else {
+        ESP_LOGI(TAG, "Running from factory partition (no mark valid)");
+    }
 
     xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-        print_running_firmware_info();
-    }
 }
